@@ -1,0 +1,1016 @@
+---
+output: 
+  html_document:
+    theme: flatly
+---
+
+# “Look at them, they are idiots lol”: Partisan Social Media Influencers, Disparagement Humor, and Audience Reaction Dynamics on TikTok
+
+## Description
+
+This is the analysis code for the study *“Look at them, they are idiots lol”: Partisan Social Media Influencers, Disparagement Humor, and Audience Reaction Dynamics on TikTok*. You need to have correct `.env` file specifying the working directory. Additionally, you require correct dataset being pre-processed (e.g., sentiment annotations). If everything is correctly set up, the code will run without any interruption. You can also knit this markdown and get an output as a single HTML file. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading Packages
+
+```{r, warning=FALSE, message=FALSE}
+
+library(tidyverse)
+library(anytime)
+library(readr)
+library(ggplot2)
+library(lme4)
+library(glmmTMB)
+library(performance)
+library(interactions)
+library(patchwork)
+library(DHARMa)
+library(sjPlot)
+library(car)
+library(emmeans)
+library(dotenv)
+library(scales)
+
+load_dot_env("../.env")
+Data_Storage <- Sys.getenv("DATA_STORAGE")
+
+```
+
+## Load & Process Data
+```{r}
+
+# Gets all the batches of comment data
+file_list <- list.files(path=file.path(Data_Storage, "roberta_annotated"), full.names = TRUE)
+# remove validation data path
+file_list <- file_list[!grepl("/sampled_", file_list)] 
+# bind all the comments together
+df_comment <- file_list %>% 
+  lapply(read_csv, col_types = cols(id = col_character(), parent_comment_id = col_character(), video_id = col_character())) %>% 
+  bind_rows()
+
+# de-duplication of comments (for some reason, many duplication were detected)
+df_comment <- df_comment %>%
+  distinct(video_url, id, text, .keep_all = TRUE)
+
+# Removing replies (although no child comments are collected from TikTok API)
+df_comment <- df_comment %>% 
+  filter(parent_comment_id == video_id)
+
+# save de-duplicated comment
+write.csv(df_comment, file.path(Data_Storage, "clean_20241001_20241130_comments_data.csv"))
+
+# load video data
+df_video <- read.csv(file.path(Data_Storage, "20241001_20241130_video_data_coding.csv"))
+
+# Total number of extracted videos
+dim(df_video)
+
+# Data formatting
+df_video <- df_video %>%
+  # removing non-partisan SMI = @philipdefranco
+  filter(username != "philipdefranco") %>% 
+  # Assigning partisan labels
+  mutate(Partisanship = case_when(
+    username %in% c("aaronparnas1", "briantylercohen", "davidpakmanshow", "harryjsisson", "joyreidofficial", "rbreich", "tizzyent", "underthedesknews") ~ as.factor("Democratic"),
+    TRUE ~ as.factor("Republican")
+  )) %>%
+  # changing data type from chr to factor
+  mutate(Disparagement = as.factor(Disparagement)) %>% 
+  # adding number of follower information, unit is kilo
+  mutate(num_followers = case_when(
+    username == "aaronparnas1" ~ 4800,
+    username == "briantylercohen" ~ 1100, 
+    username == "davidpakmanshow" ~ 1300,
+    username == "harryjsisson" ~ 2100, 
+    username == "joyreidofficial" ~ 869.7, 
+    username == "rbreich" ~ 1300, 
+    username == "tizzyent" ~ 7900, 
+    username == "underthedesknews" ~ 3700,
+    username == "adamcalhoun1" ~ 3000, 
+    username == "danbongino" ~ 640.3, 
+    username == "candaceoshow" ~ 6400, 
+    username == "daterightstuff" ~ 3200, 
+    username == "patrickbetdavid" ~ 1500, 
+    username == "real.benshapiro" ~ 2900, 
+    username == "the_jefferymead" ~ 2100, 
+    username == "thecharliekirkshow" ~ 9500, 
+    username == "thecommentssection" ~ 1700, 
+    username == "theofficertatum" ~ 1600, 
+    username == "tuckercarlson" ~ 3100
+  )) %>% 
+  # replacing the number of comments 0 to NA for the video with a closed comment section
+  mutate(comment_count = case_when(
+    video_url == "https://www.tiktok.com/@underthedesknews/video/7435498266365594911" ~ NA_real_,
+    TRUE ~ comment_count
+  )) %>% 
+  # changes made after intra-coder reliability check
+  mutate(Disparagement = case_when(
+    video_url == "https://www.tiktok.com/@real.benshapiro/video/7424214695730597151" ~ "1",
+    video_url == "https://www.tiktok.com/@tizzyent/video/7422383813440949534" ~ "1",
+    TRUE ~ Disparagement
+  ))
+
+# Descriptive statistics 
+## Overall
+df_video %>% 
+  pull(Political) %>% 
+  table()
+
+df_video %>% 
+  pull(Disparagement) %>% 
+  table()
+
+# per SMI for display
+df_description <- df_video %>% 
+  group_by(username) %>% 
+  summarise(
+    disparagement_1 = sum(Disparagement == 1),
+    disparagement_1_prop = disparagement_1/n(),
+    disparagement_0 = sum(Disparagement == 0 & Political == 1),
+    disparagement_0_prop = disparagement_0/n(),
+    political_0 = sum(Political == 0),
+    political_0_prop = political_0/n(),
+    na = sum(Political == "n/a"),
+    na_prop = na/n(),
+    total_n = n()
+  ) %>% 
+  arrange(desc(disparagement_1_prop))
+
+# show descriptive statistics
+tab_df(df_description)
+
+# Filter only Political videos
+df_video <- df_video %>% 
+  filter(Political == "1")
+
+```
+
+## Model Choice & Descriptive Statistics
+```{r}
+df_video %>%
+  summarize(across(
+    c(view_count, like_count, share_count, comment_count),
+    list(
+      n = ~sum(!is.na(.)),
+      mean = ~mean(., na.rm = TRUE),
+      var = ~var(., na.rm = TRUE),
+      sd = ~sd(., na.rm = TRUE)
+    )
+  ))
+
+# Clearly, the result is variance > mean. 
+# Therefore, negative binomial regression will be fitted when these engagement metrics are dependent Variables. 
+# Additionally, when choosing the dispersion family in the glmmTMB function, nbinom2 is thus appropriate, as it can be used when there is strong overdispersion, like this case. 
+
+# Welch Two Sample t-test to see num of follower difference across partisan camps
+followers_df_partisanship <- df_video %>% 
+  distinct(username, num_followers, Partisanship)
+t.test(num_followers ~ Partisanship, data = followers_df_partisanship)
+
+```
+
+## Data Quality Checks
+```{r, fig.width=12, fig.height=6}
+# Number of comments extracted per video
+extracted_comment_num <- df_comment %>% 
+  group_by(video_url) %>% 
+  count() %>% 
+  ungroup() %>% 
+  rename(extracted_comment_count = n)
+
+df_video_realcomm_num <- df_video %>% 
+  select(video_url, comment_count, username) %>% 
+  left_join(extracted_comment_num, by = "video_url")
+
+ggplot(df_video_realcomm_num, aes(comment_count, extracted_comment_count, colour = username)) + 
+  geom_point() + 
+  geom_abline(intercept = 0, slope = 1) + 
+  geom_abline(intercept = 500, slope = 0) +
+  coord_cartesian(xlim = c(0, 5000), ylim = c(0, 5000)) + 
+  theme_minimal() + 
+  theme(axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14))
+
+ggplot(df_video_realcomm_num, aes(comment_count, extracted_comment_count, colour = username)) + 
+  geom_point() + 
+  geom_abline(intercept = 0, slope = 1) + 
+  # geom_abline(intercept = 500, slope = 0) +
+  coord_cartesian(xlim = c(0, 30000), ylim = c(0, 30000)) + 
+  theme_minimal() + 
+  theme(axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14))
+
+df_video_realcomm_num %>% 
+  filter(extracted_comment_count < 2500) %>% 
+  ggplot(aes(extracted_comment_count)) + geom_histogram(binwidth = 100) + 
+  theme_minimal() + 
+  theme(axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14))
+
+df_video_realcomm_num %>% 
+  select(comment_count, extracted_comment_count) %>% 
+  mutate(proportion = extracted_comment_count/comment_count * 100) %>% 
+  ggplot(aes(proportion)) + geom_histogram(binwidth = 10) + 
+  theme_minimal() 
+  theme(axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14))
+
+cor.test(df_video_realcomm_num$comment_count, df_video_realcomm_num$extracted_comment_count)
+
+
+```
+
+## Time lapse from video post to comment post
+```{r}
+# Select only required info
+df_comment_longi <- df_comment %>%
+  select(video_url, id, create_time) %>%
+  rename(comment_create_time = create_time)
+
+df_video_longi <- df_video %>%
+  select(video_url, create_time) %>%
+  rename(video_create_time = create_time)
+
+video_comment_time_df <- left_join(df_video_longi, df_comment_longi, by = "video_url")
+
+# calculate comment accumulation
+df_cumulative <- video_comment_time_df %>%
+  mutate(video_time_std = anytime(video_create_time),
+         comment_time_std = anytime(comment_create_time)) %>%
+  mutate(lapse = ceiling(as.numeric(difftime(comment_time_std, video_time_std, units = "mins"))))
+
+df_comment <- left_join(df_comment, df_cumulative %>% select(video_url, id, lapse), by = c("video_url", "id"))
+
+```
+
+## Longitudinal Comment Growth
+
+```{r}
+df_cumulative <- df_cumulative %>%
+  select(video_url, lapse) %>%
+  filter(!is.na(lapse)) %>%
+  group_by(video_url) %>%
+  arrange(lapse, .by_group = TRUE) %>%
+  mutate(
+    cum_prop = row_number() / n()
+  ) %>%
+  summarise(
+    exceed_0.3_min = lapse[which.max(cum_prop > 0.3)], # get the time (min) that accumulated comments exceeded 30% of the total comment
+    exceed_0.5_min = lapse[which.max(cum_prop > 0.5)], # 50%
+    exceed_0.7_min = lapse[which.max(cum_prop > 0.7)], # 70%
+    exceed_0.9_min = lapse[which.max(cum_prop > 0.9)]  # 90%
+  ) %>%
+  ungroup()
+
+df_exceed_all <- df_cumulative %>%
+  pivot_longer(
+    cols = c(exceed_0.3_min, exceed_0.5_min, exceed_0.7_min, exceed_0.9_min),
+    names_to = "threshold",
+    values_to = "value"
+  ) %>%
+  group_by(threshold, value) %>%
+  summarise(freq = n(), .groups = "drop") %>%
+  arrange(threshold, value) %>%
+  group_by(threshold) %>%
+  mutate(cum_prop = cumsum(freq) / sum(freq)) %>%
+  ungroup()
+
+time_labels <- function(x) {
+  ifelse(
+    x < 60,
+    paste0(x, " min"),
+    ifelse(
+      x < 1440,
+      paste0(round(x / 60, 1), " h"),
+      paste0(round(x / 1440, 1), " D")
+    )
+  )
+}
+
+ggplot(df_exceed_all,
+       aes(x = value, y = cum_prop, color = threshold)) +
+  geom_line() +
+  scale_x_log10(
+    breaks = c(1, 10, 30, 60, 180, 600, 1440, 4320, 10080, 20160, 43200, 144000, 432000),
+    labels = time_labels
+  ) +
+  labs(
+    x = "Time from Post",
+    y = "Cumulative proportion of videos exceeded Threshold",
+    color = "Threshold"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+```
+
+## Calculate Sentiment Polarization
+```{r}
+# calculating sentiment proportions per video ---------
+sentiment_aggregation <- function(comment_data){
+  comment_data %>% 
+    group_by(username, video_url) %>% 
+    count(sentiment_value) %>% 
+    complete(sentiment_value = c("negative", "neutral", "positive"), fill = list(n = 0)) %>% 
+    group_by(username, video_url) %>% 
+    mutate(sentiment_proportion = n / sum(n))
+}
+
+sentiment_agg_df <- sentiment_aggregation(df_comment)
+```
+
+```{r}
+# cumulative entropy calculation function
+binary_entropy = function(p){
+  if (is.na(p)){
+    return(NA)
+  }
+  else if (p == 0 || p == 1) {
+    return(0)
+  }
+  else{
+    one_minus_p = 1 - p
+    exponent = -(p*log(p, base = 2) + (one_minus_p*log(one_minus_p, base = 2)))
+    2**exponent - 1
+  }
+}
+
+cumulative_entropy = function(data){
+  k_1 = length(data) - 1
+  each_entropy_vector = c()
+  for (j in seq(k_1)){
+    S_j = sum(data[1:j])
+    each_entropy = binary_entropy(S_j)
+    each_entropy_vector <- c(each_entropy_vector, each_entropy)
+  }
+  mean(each_entropy_vector)
+}
+
+# # Examples
+# cumulative_entropy(c(0.1, 0.2, 0.2, 0.2, 0.2, 0.1))
+# # [1] 0.6904673
+# cumulative_entropy(c(0.1, 0.8, 0.1))
+# # [1] 0.3841455
+
+```
+
+```{r}
+# Example Plot
+toy_1 <- c(0.1, 0.8, 0.1)
+toy_2 <- c(0.2, 0.6, 0.2)
+toy_3 <- c(0.3, 0.4, 0.3)
+toy_4 <- c(0.4, 0.2, 0.4)
+toy_5 <- c(0.5, 0.0, 0.5)
+toy_6 <- c(0.1, 0.3, 0.6)
+toy_7 <- c(0.0, 0.3, 0.7)
+toy_8 <- c(0.0, 0.5, 0.5)
+toy_9 <- c(0.0, 0.7, 0.3)
+
+toy_visualization <- function(vector_data){
+  score <- cumulative_entropy(vector_data) %>% 
+    round(digits = 2)
+  
+  df <- data.frame(
+    label = c("negative", "neutral", "positive"), 
+    value = vector_data
+    )
+
+  # Plot
+  ggplot(df, aes(x = label, y = value)) +
+    geom_bar(stat = "identity", fill = "#00BFC4") +
+    annotate("text", x = Inf, y = Inf, label = score,
+           hjust = 1.1, vjust = 1.56, size = 6) +
+    theme_minimal() +
+    coord_cartesian(ylim = c(0, 1))
+  }
+
+p_toy_1 <- toy_visualization(toy_1)
+p_toy_2 <- toy_visualization(toy_2)
+p_toy_3 <- toy_visualization(toy_3)
+p_toy_4 <- toy_visualization(toy_4)
+p_toy_5 <- toy_visualization(toy_5)
+p_toy_6 <- toy_visualization(toy_6)
+p_toy_7 <- toy_visualization(toy_7)
+p_toy_8 <- toy_visualization(toy_8)
+p_toy_9 <- toy_visualization(toy_9)
+
+(p_toy_1 + p_toy_2 + p_toy_3 + p_toy_4 + p_toy_5 + p_toy_6 + p_toy_7 + p_toy_8 + p_toy_9) +
+  plot_layout(guides = "collect") &
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+
+
+```
+
+```{r}
+# calculating sentiment polarization score per video 
+polarization_calculation <- function(aggregated_comment_sentiment_data){
+  aggregated_comment_sentiment_data %>% 
+    group_by(username, video_url) %>% 
+    mutate(polarization_score = cumulative_entropy(sentiment_proportion)) %>% 
+    pivot_wider(
+      id_cols = c(video_url, username, polarization_score),
+      names_from = sentiment_value, 
+      values_from = c(n, sentiment_proportion),
+      names_glue = "{sentiment_value}_{.value}"
+    ) %>% 
+    rowwise() %>%
+    mutate(sum = sum(negative_n, neutral_n, positive_n, na.rm = T)) %>% 
+    ungroup()
+}
+
+polarization_agg_df <- polarization_calculation(sentiment_agg_df)
+
+
+# 
+# # Creating and calculating longtitudional data
+# longitudinal_data <- map_dfr(1:24, function(hour) {
+#   threshold_lapse <- hour * 60
+# 
+#   df_comment %>%
+#     filter(lapse <= threshold_lapse) %>%
+#     sentiment_aggregation() %>%
+#     polarization_calculation() %>%
+#     mutate(time = hour)
+# })
+# 
+# longitudinal_data_completed <- longitudinal_data %>%
+#   group_by(video_url, username) %>%
+#   complete(
+#     time = 1:24,
+#     fill = list(polarization_score = NA_real_, negative_n = 0, neutral_n = 0, positive_n = 0, negative_sentiment_proportion = NA_real_, neutral_sentiment_proportion = NA_real_, positive_sentiment_proportion = NA_real_, sum = 0))
+# 
+
+```
+
+```{r}
+# merge it back to video_data
+final_df <- left_join(df_video, polarization_agg_df, by = c("video_url", "username"))
+
+# write it to csv file to be safe
+write.csv(final_df, file.path(Data_Storage, "20241001_20241130_video_data_with_pol_score.csv"))
+
+df_video <- final_df
+
+df_video$Disparagement <- factor(
+  df_video$Disparagement,
+  levels = c(0, 1),
+  labels = c("Non-disparagement", "Disparagement")
+)
+
+# Descriptive analysis of sentiment polarization
+df_video %>% 
+  select(polarization_score) %>% 
+  summarize(n = n(),
+            na = sum(is.na(polarization_score)), 
+            m = mean(polarization_score, na.rm = TRUE), 
+            sd = sd(polarization_score, na.rm = TRUE))
+
+# Descriptive statistics of comments (only comments attached to the included videos)
+df_video %>% 
+  pull(sum) %>% 
+  sum(na.rm = TRUE)
+
+df_video %>% 
+  select(sum) %>% 
+  summarize(m = mean(sum, na.rm = TRUE), 
+            sd = sd(sum, na.rm = TRUE))
+  
+
+```
+
+## RQ1 Descriptive Analysis
+```{r}
+# Changing data type to numeric one, and subtract 1 so that values become 0 and 1, not 1 and 2 ---------
+df_descriptive <- df_video %>% 
+  mutate(Disparagement = as.numeric(Disparagement) - 1)
+
+# Political video's stats
+df_video %>%
+  count(username) %>%
+  summarise(mean = mean(n), sd = sd(n))
+
+# Disparagement proportion stats
+df_descriptive %>% 
+  select(Disparagement) %>% 
+  summarize(mean = mean(Disparagement))
+
+# Disparagement count and count per partisan SMI stats
+df_descriptive %>%
+  group_by(username) %>% 
+  summarize(N = sum(Disparagement), .groups = 'drop') %>% 
+  summarise(Total = sum(N), mean = mean(N), sd = sd(N))
+  
+# Per Partisanship stats
+df_descriptive <- df_descriptive %>% 
+  group_by(Partisanship, username) %>% 
+  summarize(disparagement_prop = mean(Disparagement, na.rm = TRUE), 
+            N_all = n(), 
+            N_disparagement = sum(Disparagement))
+
+df_descriptive %>% 
+  group_by(Partisanship) %>% 
+  summarize(Mean = mean(disparagement_prop, na.rm = TRUE), 
+            SD = sd(disparagement_prop, na.rm = TRUE))
+
+# Welch Two Sample t-test to see inter-partisan difference
+t.test(disparagement_prop ~ Partisanship, data = df_descriptive)
+
+```
+## Multilevel Regression Model Fit (null-model)
+```{r}
+## num of view
+null_model_view <- glmmTMB(view_count ~ 1 + (1 | username), data = df_video, family = nbinom2(link = "log"))
+
+## num of likes
+null_model_like <- glmmTMB(like_count ~ 1 + (1 | username), data = df_video, family = nbinom2(link = "log"))
+
+## num of shares
+null_model_share <- glmmTMB(share_count ~ 1 + (1 | username), data = df_video, family = nbinom2(link = "log"))
+
+## num of comments
+null_model_comment <- glmmTMB(comment_count ~ 1 + (1 | username), data = df_video, family = nbinom2(link = "log"))
+
+# Output
+tab_model(null_model_view, null_model_like, null_model_share, null_model_comment, 
+          transform = NULL, 
+          auto.label = TRUE, 
+          collapse.ci = FALSE, 
+          dv.labels = c("Views", "Likes", "Shares", "Comments"), 
+          show.ci = FALSE, 
+          show.se = TRUE)
+
+## sentiment polarization
+null_model_polarization <- lmer(polarization_score ~ 1 + (1 | username), data = df_video)
+
+# Output
+tab_model(null_model_polarization, 
+          transform = NULL, 
+          auto.label = TRUE, 
+          collapse.ci = FALSE, 
+          dv.labels = c("Sentiment Polarization"), 
+          show.ci = FALSE, 
+          show.se = TRUE)
+
+```
+
+
+## H1 (disparagement -> engagement)
+
+```{r}
+## num of view
+h1_model_view <- glmmTMB(view_count ~ Disparagement + (1 | username), data = df_video, family = nbinom2(link = "log"))
+# sim_res_h1_model_view <- simulateResiduals(h1_model_view)
+# testDispersion(sim_res_h1_model_view)
+
+## num of likes
+h1_model_like <- glmmTMB(like_count ~ Disparagement + (1 | username), data = df_video, family = nbinom2(link = "log"))
+# sim_res_h1_model_like <- simulateResiduals(h1_model_like)
+# testDispersion(sim_res_h1_model_like)
+
+## num of shares
+h1_model_share <- glmmTMB(share_count ~ Disparagement + (1 | username), data = df_video, family = nbinom2(link = "log"))
+# sim_res_h1_model_share <- simulateResiduals(h1_model_share)
+# testDispersion(sim_res_h1_model_share)
+
+## num of comments
+h1_model_comment <- glmmTMB(comment_count ~ Disparagement + (1 | username), data = df_video, family = nbinom2(link = "log"))
+# sim_res_h1_model_comment <- simulateResiduals(h1_model_comment)
+# testDispersion(sim_res_h1_model_comment)
+
+# html output of the result ---------
+tab_model(h1_model_view, h1_model_like, h1_model_share, h1_model_comment, 
+          transform = NULL, 
+          auto.label = TRUE, 
+          collapse.ci = FALSE, 
+          dv.labels = c("Views", "Likes", "Shares", "Comments"), 
+          show.ci = FALSE, 
+          show.se = TRUE)
+
+```
+
+## H2 (disparagement -> polarization)
+
+```{r}
+h2_model <- lmer(polarization_score ~ Disparagement + (1 | username), data = df_video)
+# sim_res_h2_model_like <- simulateResiduals(h2_model)
+# testDispersion(sim_res_h2_model_like)
+# summary(h2_model)
+
+tab_model(h2_model, 
+          transform = NULL, 
+          auto.label = TRUE, 
+          collapse.ci = FALSE, 
+          dv.labels = c("Sentiment Polarization"), 
+          show.ci = FALSE, 
+          show.se = TRUE)
+
+# visualization
+df_sentiment_vis <- df_video %>% 
+  # group_by(Disparagement) %>% 
+  summarise(n=n(),
+            agg_negative_proportion = mean(negative_sentiment_proportion, na.rm = TRUE), 
+            agg_neutral_proportion = mean(neutral_sentiment_proportion, na.rm = TRUE), 
+            agg_positive_proportion = mean(positive_sentiment_proportion, na.rm = TRUE), 
+            
+            agg_negative_sd = sd(negative_sentiment_proportion, na.rm = TRUE), 
+            agg_neutral_sd = sd(neutral_sentiment_proportion, na.rm = TRUE), 
+            agg_positive_sd = sd(positive_sentiment_proportion, na.rm = TRUE), 
+            
+            agg_negative_se = agg_negative_sd/sqrt(n), 
+            agg_neutral_se = agg_neutral_sd/sqrt(n), 
+            agg_positive_se = agg_positive_sd/sqrt(n)
+            )
+
+df_long_sentiment_vis <- df_sentiment_vis %>%
+  pivot_longer(cols = matches("^agg_(negative|neutral|positive)_(proportion|se)$"),
+               names_to = c("sentiment", ".value"), 
+               names_pattern = "agg_(negative|neutral|positive)_(proportion|se)"
+               )
+
+ggplot(df_long_sentiment_vis, aes(x = sentiment, y = proportion)) +
+  geom_col() +
+  geom_col(fill = "#00BFC4") + 
+  geom_errorbar(aes(ymin = proportion - se, ymax = proportion + se), width = 0.2) +
+  labs(x = "Sentiment", y = "Proportion") +
+  coord_cartesian(ylim = c(0, 1)) +
+  theme_minimal()+ 
+  theme(axis.text.x = element_text(size = 12),
+        axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14))
+
+```
+
+## RQ2 (disparagement * polarization -> engagement & disparagement * engagement -> polarization)
+
+```{r}
+## num of view
+rq2_model_view <- glmmTMB(view_count ~ Disparagement * polarization_score + (1 | username), data = df_video, family = nbinom2(link = "log"))
+rq2_model_view_no_interaction <- glmmTMB(view_count ~ Disparagement + polarization_score + (1 | username), data = df_video, family = nbinom2(link = "log"))
+# summary(rq2_model_view)
+
+## num of likes
+rq2_model_like <- glmmTMB(like_count ~ Disparagement * polarization_score + (1 | username), data = df_video, family = nbinom2(link = "log"))
+rq2_model_like_no_interaction <- glmmTMB(like_count ~ Disparagement + polarization_score + (1 | username), data = df_video, family = nbinom2(link = "log"))
+# summary(rq2_model_like)
+
+## num of shares
+rq2_model_share <- glmmTMB(share_count ~ Disparagement * polarization_score + (1 | username), data = df_video, family = nbinom2(link = "log"))
+rq2_model_share_no_interaction <- glmmTMB(share_count ~ Disparagement + polarization_score + (1 | username), data = df_video, family = nbinom2(link = "log"))
+# summary(rq2_model_share)
+
+## num of comments
+rq2_model_comment <- glmmTMB(comment_count ~ Disparagement * polarization_score + (1 | username), data = df_video, family = nbinom2(link = "log"))
+rq2_model_comment_no_interaction <- glmmTMB(comment_count ~ Disparagement + polarization_score + (1 | username), data = df_video, family = nbinom2(link = "log"))
+# summary(rq2_model_comment)
+
+## sentiment polarization, view
+rq2_model_polarization_view <- lmer(polarization_score ~ Disparagement * log10(view_count) + (1 | username), data = df_video)
+rq2_model_polarization_view_no_interaction <- lmer(polarization_score ~ Disparagement + log10(view_count) + (1 | username), data = df_video)
+# summary(rq2_model_polarization_view)
+
+## sentiment polarization, like
+rq2_model_polarization_like <- lmer(polarization_score ~ Disparagement * log10(like_count) + (1 | username), data = df_video)
+rq2_model_polarization_like_no_interaction <- lmer(polarization_score ~ Disparagement + log10(like_count) + (1 | username), data = df_video)
+# summary(rq2_model_polarization_like)
+
+## sentiment polarization, share
+### log + 1 transformation
+rq2_model_polarization_share <- lmer(polarization_score ~ Disparagement * log10(share_count + 1) + (1 | username), data = df_video)
+rq2_model_polarization_share_no_interaction <- lmer(polarization_score ~ Disparagement + log10(share_count + 1) + (1 | username), data = df_video)
+# summary(rq2_model_polarization_share)
+
+## sentiment polarization, comment
+### log + 1 transformation
+rq2_model_polarization_comment <- lmer(polarization_score ~ Disparagement * log10(comment_count + 1) + (1 | username), data = df_video)
+rq2_model_polarization_comment_no_interaction <- lmer(polarization_score ~ Disparagement + log10(comment_count + 1) + (1 | username), data = df_video)
+# summary(rq2_model_polarization_comment)
+
+# html output of the result ---------
+tab_model(rq2_model_view, rq2_model_like, rq2_model_share, rq2_model_comment, 
+          transform = NULL, 
+          auto.label = TRUE, 
+          collapse.ci = FALSE, 
+          dv.labels = c("Views", "Likes", "Shares", "Comments"), 
+          show.ci = FALSE, 
+          show.se = TRUE)
+
+tab_model(rq2_model_polarization_view, rq2_model_polarization_like, rq2_model_polarization_share, rq2_model_polarization_comment, 
+          transform = NULL, 
+          auto.label = TRUE, 
+          collapse.ci = FALSE, 
+          dv.labels = "Polarization Score (engagement metrics log-transformed)", 
+          show.ci = FALSE, 
+          show.se = TRUE)
+
+tab_model(rq2_model_view_no_interaction, rq2_model_like_no_interaction, rq2_model_share_no_interaction, rq2_model_comment_no_interaction,
+          transform = NULL,
+          auto.label = TRUE,
+          collapse.ci = FALSE,
+          dv.labels = c("Views", "Likes", "Shares", "Comments"),
+          show.ci = FALSE,
+          show.se = TRUE)
+
+tab_model(rq2_model_polarization_view_no_interaction, rq2_model_polarization_like_no_interaction, rq2_model_polarization_share_no_interaction, rq2_model_polarization_comment_no_interaction,
+          transform = NULL,
+          auto.label = TRUE,
+          collapse.ci = FALSE,
+          dv.labels = "Polarization Score (engagement metrics log-transformed)",
+          show.ci = FALSE,
+          show.se = TRUE)
+
+
+```
+
+## RQ2 Vizualzation
+
+```{r, fig.width=12, fig.height=6}
+figure_for_rq2 <- function(regression_model, fig_num){
+  plot_model(
+    regression_model,
+    type = "pred",
+    terms = c("polarization_score", "Disparagement"),
+    line.size = 1.5) +
+    aes(linetype = group, colour = group) +
+    scale_colour_manual(values = c("Non-disparagement" = "darkgreen", "Disparagement" = "purple")) +
+    scale_fill_manual(values = c("Non-disparagement" = "darkgreen", "Disparagement" = "purple")) +
+    scale_y_continuous(limits = c(0, NA)) +
+    labs(title = fig_num, colour = "Disparagement", linetype = "Disparagement", shape = "Disparagement") +
+    theme_minimal()
+}
+
+p_rq2_view <- figure_for_rq2(rq2_model_view, "A")
+p_rq2_like <- figure_for_rq2(rq2_model_like, "B")
+p_rq2_share <- figure_for_rq2(rq2_model_share, "C")
+p_rq2_comment <- figure_for_rq2(rq2_model_comment, "D")
+
+(p_rq2_view + p_rq2_like + p_rq2_share + p_rq2_comment) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "right",
+        title = element_text(size = 18),
+        strip.text = element_text(size = 14),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14))
+
+```
+
+<!-- ## RQ2 (VAR) -->
+<!-- ```{r} -->
+
+<!-- # Due to poor quality of fetched comment data, Panel Vector Autoregressive model was impossible to run. -->
+
+<!-- # library(panelvar) -->
+<!-- #  -->
+<!-- # longitudinal_data_needed <- longitudinal_data_completed %>% -->
+<!-- #   mutate( -->
+<!-- #     comment_increase = c(sum[1], diff(sum)), -->
+<!-- #     polarization_change = c(polarization_score[1], diff(polarization_score)) -->
+<!-- #   ) %>% -->
+<!-- #   select(username, video_url, time, comment_increase, polarization_change) %>% -->
+<!-- #   ungroup() -->
+<!-- #  -->
+<!-- # longitudinal_data_needed_with_id <- longitudinal_data_needed %>% -->
+<!-- #   mutate(video_id = str_split_i(video_url, "/", -1)) %>% -->
+<!-- #   data.frame() -->
+<!-- #  -->
+<!-- # varone <- pvargmm( -->
+<!-- #   dependent_vars = c("comment_increase", "polarization_change"), -->
+<!-- #   lags = 1, -->
+<!-- #   transformation = "fd", -->
+<!-- #   data = longitudinal_data_needed_with_id, -->
+<!-- #   panel_identifier = c("video_id", "time"), -->
+<!-- #   steps = c("twostep"), -->
+<!-- #   system_instruments = TRUE, -->
+<!-- #   max_instr_dependent_vars = 99, -->
+<!-- #   min_instr_dependent_vars = 2L, -->
+<!-- #   collapse = FALSE -->
+<!-- # ) -->
+
+
+<!-- ``` -->
+
+
+## RQ3 (disparagement * partisanship -> engagement, polarization)
+
+### RQ3a disparagement * partisanship -> engagement
+
+```{r}
+## num of view
+rq3_model_view <- glmmTMB(view_count ~ Disparagement * Partisanship + (1 | username), data = df_video, family = nbinom2(link = "log"))
+# sim_res_rq3_model_view <- simulateResiduals(rq3_model_view)
+# testDispersion(sim_res_rq3_model_view)
+
+## num of likes
+rq3_model_like <- glmmTMB(like_count ~ Disparagement * Partisanship + (1 | username), data = df_video, family = nbinom2(link = "log"))
+# sim_res_rq3_model_like <- simulateResiduals(rq3_model_like)
+# testDispersion(sim_res_rq3_model_like)
+
+## num of shares
+rq3_model_share <- glmmTMB(share_count ~ Disparagement * Partisanship + (1 | username), data = df_video, family = nbinom2(link = "log"))
+# sim_res_rq3_model_share <- simulateResiduals(rq3_model_share)
+# testDispersion(sim_res_rq3_model_share)
+
+## num of comments
+rq3_model_comment <- glmmTMB(comment_count ~ Disparagement * Partisanship + (1 | username), data = df_video, family = nbinom2(link = "log"))
+# sim_res_rq3_model_comment <- simulateResiduals(rq3_model_comment)
+# testDispersion(sim_res_rq3_model_comment)
+
+# html output of the result
+tab_model(rq3_model_view, rq3_model_like, rq3_model_share, rq3_model_comment, 
+          transform = NULL, 
+          auto.label = TRUE, 
+          collapse.ci = FALSE, 
+          dv.labels = c("Views", "Likes", "Shares", "Comments"), 
+          show.ci = FALSE, 
+          show.se = TRUE)
+
+```
+
+### RQ3b disparagement * partisanship -> polarization
+
+```{r}
+## sentiment polarization
+rq3_model_polarization <- lmer(polarization_score ~ Disparagement * Partisanship + (1 | username), data = df_video)
+
+tab_model(rq3_model_polarization, 
+          transform = NULL, 
+          auto.label = TRUE, 
+          collapse.ci = FALSE, 
+          dv.labels = "Polarization", 
+          show.ci = FALSE, 
+          show.se = TRUE)
+
+```
+
+### RQ3c disparagement * partisanship * polarization -> engagement
+
+```{r}
+## num of view
+rq3c_model_view <- glmmTMB(view_count ~ Disparagement * Partisanship * polarization_score + (1 | username), data = df_video, family = nbinom2(link = "log"))
+
+## num of likes
+rq3c_model_like <- glmmTMB(like_count ~ Disparagement * Partisanship * polarization_score + (1 | username), data = df_video, family = nbinom2(link = "log"))
+
+## num of shares
+rq3c_model_share <- glmmTMB(share_count ~ Disparagement * Partisanship * polarization_score + (1 | username), data = df_video, family = nbinom2(link = "log"))
+
+## num of comments
+rq3c_model_comment <- glmmTMB(comment_count ~ Disparagement * Partisanship * polarization_score + (1 | username), data = df_video, family = nbinom2(link = "log"))
+
+tab_model(rq3c_model_view, rq3c_model_like, rq3c_model_share, rq3c_model_comment, 
+          transform = NULL, 
+          auto.label = TRUE, 
+          collapse.ci = FALSE, 
+          dv.labels = c("Views", "Likes", "Shares", "Comments"), 
+          show.ci = FALSE, 
+          show.se = TRUE)
+
+```
+
+### RQ3c Vizualzation
+
+```{r, fig.width=12, fig.height=6}
+figure_for_rq3c <- function(regression_model, fig_num){
+  plot_model(
+    regression_model,
+    type = "pred",
+    terms = c("polarization_score", "Disparagement", "Partisanship"),
+    line.size = 1.5) +
+    aes(linetype = group, colour = group) +
+    scale_colour_manual(values = c("Non-disparagement" = "darkgreen", "Disparagement" = "purple")) +
+    scale_fill_manual(values = c("Non-disparagement" = "darkgreen", "Disparagement" = "purple")) +
+    scale_y_continuous(limits = c(0, NA)) +
+    labs(title = fig_num, colour = "Disparagement", linetype = "Disparagement", shape = "Disparagement") +
+    theme_minimal()
+}
+
+p_rq3c_view <- figure_for_rq3c(rq3c_model_view, "A")
+p_rq3c_like <- figure_for_rq3c(rq3c_model_like, "B")
+p_rq3c_share <- figure_for_rq3c(rq3c_model_share, "C")
+p_rq3c_comment <- figure_for_rq3c(rq3c_model_comment, "D")
+
+(p_rq3c_view + p_rq3c_like + p_rq3c_share + p_rq3c_comment) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "right",
+        title = element_text(size = 18),
+        strip.text = element_text(size = 14),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14))
+
+```
+
+### RQ3c disparagement * partisanship * engagement -> polarization
+```{r}
+## sentiment polarization, view
+rq3c_model_polarization_view <- lmer(polarization_score ~ Disparagement * Partisanship * log10(view_count) + (1 | username), data = df_video)
+
+## sentiment polarization, like
+rq3c_model_polarization_like <- lmer(polarization_score ~ Disparagement * Partisanship * log10(like_count) + (1 | username), data = df_video)
+
+## sentiment polarization, share
+### log + 1 transformation
+rq3c_model_polarization_share <- lmer(polarization_score ~ Disparagement * Partisanship * log10(share_count + 1) + (1 | username), data = df_video)
+
+## sentiment polarization, comment
+### log + 1 transformation
+rq3c_model_polarization_comment <- lmer(polarization_score ~ Disparagement * Partisanship * log10(comment_count + 1) + (1 | username), data = df_video)
+
+tab_model(rq3c_model_polarization_view, rq3c_model_polarization_like, rq3c_model_polarization_share, rq3c_model_polarization_comment, 
+          transform = NULL, 
+          auto.label = TRUE, 
+          collapse.ci = FALSE, 
+          dv.labels = "Polarization", 
+          show.ci = FALSE, 
+          show.se = TRUE)
+
+```
+
+### RQ3c Post-Hoc analysis
+
+```{r}
+## num of view
+rq3c_model_view_post <- glmmTMB(view_count ~ Disparagement + Partisanship * polarization_score + (1 | username), data = df_video, family = nbinom2(link = "log"))
+
+## num of likes
+rq3c_model_like_post <- glmmTMB(like_count ~ Disparagement + Partisanship * polarization_score + (1 | username), data = df_video, family = nbinom2(link = "log"))
+
+## num of shares
+rq3c_model_share_post <- glmmTMB(share_count ~ Disparagement + Partisanship * polarization_score + (1 | username), data = df_video, family = nbinom2(link = "log"))
+
+## num of comments
+rq3c_model_comment_post <- glmmTMB(comment_count ~ Disparagement + Partisanship * polarization_score + (1 | username), data = df_video, family = nbinom2(link = "log"))
+
+tab_model(rq3c_model_view_post, rq3c_model_like_post, rq3c_model_share_post, rq3c_model_comment_post, 
+          transform = NULL, 
+          auto.label = TRUE, 
+          collapse.ci = FALSE, 
+          dv.labels = c("Views", "Likes", "Shares", "Comments"), 
+          show.ci = FALSE, 
+          show.se = TRUE)
+
+
+## sentiment polarization, view
+post_rq3c_model_polarization_view <- lmer(polarization_score ~ Disparagement + Partisanship * log10(view_count) + (1 | username), data = df_video)
+
+## sentiment polarization, like
+post_rq3c_model_polarization_like <- lmer(polarization_score ~ Disparagement + Partisanship * log10(like_count) + (1 | username), data = df_video)
+
+## sentiment polarization, share
+### log + 1 transformation
+post_rq3c_model_polarization_share <- lmer(polarization_score ~ Disparagement + Partisanship * log10(share_count + 1) + (1 | username), data = df_video)
+
+## sentiment polarization, comment
+### log + 1 transformation
+post_rq3c_model_polarization_comment <- lmer(polarization_score ~ Disparagement + Partisanship * log10(comment_count + 1) + (1 | username), data = df_video)
+
+
+tab_model(post_rq3c_model_polarization_view, post_rq3c_model_polarization_like, post_rq3c_model_polarization_share, post_rq3c_model_polarization_comment, 
+          transform = NULL, 
+          auto.label = TRUE, 
+          collapse.ci = FALSE, 
+          dv.labels = c("Views", "Likes", "Shares", "Comments"), 
+          show.ci = FALSE, 
+          show.se = TRUE)
+
+```
+
+### RQ3c Post-Hoc Vizualzation
+
+```{r, fig.width=12, fig.height=6}
+
+figure_for_rq3c_post <- function(regression_model, term, fig_num){
+  plot_model(
+    regression_model,
+    type = "pred",
+    terms = c(term, "Partisanship"),
+    line.size = 1.5) +
+    aes(linetype = group, colour = group) +
+    scale_colour_manual(values = c("Democratic" = "blue", "Republican" = "red")) +
+    scale_fill_manual(values = c("Democratic" = "blue", "Republican" = "red")) +
+    scale_y_continuous(limits = c(0, NA)) +
+    labs(title = fig_num, colour = "Partisanship", linetype = "Partisanship", shape = "Partisanship") +
+    theme_minimal()
+}
+
+p_rq3c_view_post <- figure_for_rq3c_post(rq3c_model_view_post, "polarization_score", "A")
+p_rq3c_like_post <- figure_for_rq3c_post(rq3c_model_like_post, "polarization_score", "B")
+p_rq3c_share_post <- figure_for_rq3c_post(rq3c_model_share_post, "polarization_score", "C")
+p_rq3c_comment_post <- figure_for_rq3c_post(rq3c_model_comment_post, "polarization_score", "D")
+
+(p_rq3c_view_post + p_rq3c_like_post + p_rq3c_share_post + p_rq3c_comment_post) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "right",
+        title = element_text(size = 18),
+        strip.text = element_text(size = 14),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14))
+
+```

@@ -1,0 +1,92 @@
+---
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(irr)
+library(caret)
+library(dotenv)
+
+load_dot_env("../.env")
+Data_Storage <- Sys.getenv("DATA_STORAGE")
+
+set.seed(123)
+
+```
+
+```{r}
+# # load comment data
+# # Validation data comes from comments collected on 27.03.2026, collected from randomly sampled videos. 
+# df <- read.csv(file.path(Data_Storage, "comments_data",  "20241001_20241130_comments_data_batch_1.csv"))
+# 
+# df_sample <- sample_n(df, 500) # extract 500 comments
+# 
+# write.csv(df_sample, file = file.path(Data_Storage, "manually_annotated", "sampled_20241001_20241130_comments_data.csv"))
+```
+
+## After human annotation and machine annotation
+```{r}
+# human annotated data
+annotated_df <- read.csv(file.path(Data_Storage, "manually_annotated", "sampled_20241001_20241130_comments_data_manual_annotation.csv")) %>% 
+  select(Column1, human_sentiment, text)
+
+annotated_df %>% 
+  select(human_sentiment) %>% 
+  table()
+
+# vader annotated data
+vader_df <- read.csv(file.path(Data_Storage, "vader_annotated", "sampled_20241001_20241130_comments_data_annotated.csv")) %>% 
+  select(Unnamed..0, sentiment_label, text) %>% 
+  rename(vader_sentiment = sentiment_label, 
+         Column1 = Unnamed..0)
+
+# roberta annotated data
+roberta_df <- read.csv(file.path(Data_Storage, "roberta_annotated", "sampled_20241001_20241130_comments_data_annotated.csv")) %>% 
+  select(Unnamed..0, sentiment_value, text) %>% 
+  rename(roberta_sentiment = sentiment_value, 
+         Column1 = Unnamed..0)
+
+merged_df <- left_join(annotated_df, vader_df, by = c("Column1", "text")) %>% 
+  left_join(roberta_df, by = c("Column1", "text"))
+
+merged_df <- merged_df %>%
+  mutate(
+    human_sentiment = case_when(
+      human_sentiment == "negative" ~ 1,
+      human_sentiment == "neutral"  ~ 2,
+      human_sentiment == "positive" ~ 3
+    ), 
+    vader_sentiment = case_when(
+      vader_sentiment == "negative" ~ 1,
+      vader_sentiment == "neutral"  ~ 2,
+      vader_sentiment == "positive" ~ 3
+    ), 
+    roberta_sentiment = case_when(
+      roberta_sentiment == "negative" ~ 1,
+      roberta_sentiment == "neutral"  ~ 2,
+      roberta_sentiment == "positive" ~ 3
+    )
+  )
+# human vs VADER
+merged_df %>%
+  select(human_sentiment, vader_sentiment) %>% 
+  t() %>% 
+  kripp.alpha(method="ordinal")
+cm <- confusionMatrix(as.factor(merged_df$vader_sentiment), reference = as.factor(merged_df$human_sentiment), mode = "prec_recall")
+cm
+
+# human vs RoBERTa
+merged_df %>%
+  select(human_sentiment, roberta_sentiment) %>% 
+  t() %>% 
+  kripp.alpha(method="ordinal")
+
+cm <- confusionMatrix(as.factor(merged_df$roberta_sentiment), reference = as.factor(merged_df$human_sentiment), mode = "prec_recall")
+cm
+
+```

@@ -1,0 +1,78 @@
+---
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(irr)
+library(caret)
+library(dotenv)
+
+load_dot_env("../.env")
+Data_Storage <- Sys.getenv("DATA_STORAGE")
+
+set.seed(123)
+
+```
+
+```{r}
+# # create sample dataset for second coding
+# second_code_df <- read.csv(file.path(Data_Storage, "20241001_20241130_video_data.csv"))
+# 
+# second_code_df %>%
+#   sample_frac(0.1) %>%
+#   write.csv(file = file.path(Data_Storage, "reliability_check_20241001_20241130_video_data.csv"))
+```
+
+```{r}
+# After finishing coding the reliability check data
+second_code_df <- read.csv(file.path(Data_Storage, "reliability_check_20241001_20241130_video_data_coding.csv")) %>% 
+  filter(Political_2 == "0"| Political_2 == "1") %>% 
+  select(video_url, Political_2, Disparagement_2)
+
+coded_video_urls <- second_code_df %>% 
+  pull(video_url)
+```
+
+```{r}
+# load first code result
+initial_code_df <- read.csv(file.path(Data_Storage, "20241001_20241130_video_data_coding.csv"))
+
+# sample videos
+initial_code_df_sample <- initial_code_df %>% 
+  filter(video_url %in% coded_video_urls) %>% 
+  rename(Disparagement_1 = Disparagement, 
+         Political_1 = Political) %>% 
+  select(video_url, Political_1, Disparagement_1)
+
+```
+
+```{r}
+
+merged_df <- left_join(initial_code_df_sample, second_code_df, by = "video_url") %>% 
+  mutate(Disparagement_1 = as.character(Disparagement_1), 
+         Disparagement_2 = as.character(Disparagement_2), 
+         Political_1 = as.character(Political_1), 
+         Political_2 = as.character(Political_2))
+
+# Reliability of Political content
+merged_df %>%
+  select(Political_1, Political_2) %>% 
+  t() %>% 
+  kripp.alpha(method="nominal")
+
+# human vs RoBERTa
+merged_df %>%
+  filter(Political_1 != "99") %>% 
+  select(Disparagement_1, Disparagement_2) %>%
+  t() %>% 
+  kripp.alpha(method="nominal")
+
+merged_df %>%
+  filter(Disparagement_1 != Disparagement_2)
+
+```
