@@ -39,7 +39,7 @@ cd TikTokSMI_Disparagement_Humor
 1. Run `data_collection/TikTok_fetch.py` to fetch TikTok data
 2. Code TikTok Content (manually, see codebook in the main paper)
 3. Run `data_processing/sentiment_analysis.py` to label sentiment to each comment
-4. Run `data_processing/data_analysis.Rmd` to analyze data
+4. Run `data_analysis/data_analysis.Rmd` to analyze data
 
 ## TikTok Data Collection
 ### Dependencies
